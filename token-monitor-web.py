@@ -28,7 +28,7 @@ WARN_PCT        = 0.80
 CRITICAL_PCT    = 0.90
 CACHE_TTL       = 300
 PLAN_WINDOW     = 5 * 3600
-PLAN_LIMIT      = 280_000
+PLAN_LIMIT      = 280_000  # observed off-peak (~23:00); actual peak limit unknown
 
 PRICES = {
     "input":       3.00,
