@@ -1221,6 +1221,12 @@ function updateResetBadge(reset_at) {
 }
 
 function tickTimers() {
+  // clock always ticks client-side
+  const now = new Date();
+  const pad = n => n.toString().padStart(2,'0');
+  document.getElementById('clock').textContent =
+    `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+
   if (!_lastData) return;
   const plan = _lastData.plan || {};
   updateResetBadge(plan.reset_at);
