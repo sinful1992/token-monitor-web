@@ -99,7 +99,7 @@ USABLE_LIMIT    = 167_000   # context actually usable before compaction
 WARN_PCT        = 0.80      # yellow warning threshold
 CRITICAL_PCT    = 0.90      # red critical threshold
 PLAN_WINDOW     = 5 * 3600  # rolling window for plan limit (seconds)
-PLAN_LIMIT      = 237_000   # max output tokens per 5h window (calibrated empirically)
+PLAN_LIMIT      = 280_000   # max output tokens per 5h window (peak hours)
 CACHE_TTL       = 300       # prompt cache TTL (seconds) — used for cache_expires_in display
 ```
 

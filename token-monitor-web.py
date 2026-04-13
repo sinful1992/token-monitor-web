@@ -28,7 +28,7 @@ WARN_PCT        = 0.80
 CRITICAL_PCT    = 0.90
 CACHE_TTL       = 300
 PLAN_WINDOW     = 5 * 3600
-PLAN_LIMIT      = 237_000
+PLAN_LIMIT      = 280_000
 
 PRICES = {
     "input":       3.00,
