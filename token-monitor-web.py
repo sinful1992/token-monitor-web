@@ -355,6 +355,8 @@ def compute_stats(turns: list[dict]) -> dict:
                 pass
             break
 
+    tokens_per_turn = (total_input + total_cr + total_cw + total_output) / len(turns)
+
     return {
         "turns":            len(turns),
         "context_tokens":   context_tokens,
@@ -363,7 +365,10 @@ def compute_stats(turns: list[dict]) -> dict:
         "usable_left":      USABLE_LIMIT - context_tokens,
         "cache_hit":        last["cache_read"] / cacheable if cacheable else 0,
         "total_input":      total_input,
+        "total_cr":         total_cr,
+        "total_cw":         total_cw,
         "total_output":     total_output,
+        "tokens_per_turn":  tokens_per_turn,
         "cost":             cost,
         "last_input":       last["input"],
         "last_cr":          last["cache_read"],
@@ -432,7 +437,7 @@ def compute_plan_usage() -> dict:
 def build_snapshot() -> dict:
     """Build snapshot using cached live sessions (no /proc scan here)."""
     sessions_out = []
-    agg = {"turns": 0, "cost": 0.0, "input": 0, "output": 0, "cache_hit_num": 0.0, "cache_hit_den": 0}
+    agg = {"turns": 0, "cost": 0.0, "input": 0, "output": 0, "total_cr": 0, "total_cw": 0, "cache_hit_num": 0.0, "cache_hit_den": 0}
 
     for sess in _live_sessions:
         # Skip stale entries — process died since last 60s refresh
@@ -446,8 +451,11 @@ def build_snapshot() -> dict:
             agg["cost"]         += stats["cost"]
             agg["input"]        += stats["total_input"]
             agg["output"]       += stats["total_output"]
+            agg["total_cr"]     += stats.get("total_cr", 0)
+            agg["total_cw"]     += stats.get("total_cw", 0)
             agg["cache_hit_num"] += stats["cache_hit"] * stats["turns"]
             agg["cache_hit_den"] += stats["turns"]
+            stats["cw_history"] = [t["cache_write"] for t in turns[-40:]]
         sessions_out.append({
             "pid":      sess["pid"],
             "pts":      sess["pts"],
@@ -458,6 +466,8 @@ def build_snapshot() -> dict:
 
     agg["cache_hit"] = (agg["cache_hit_num"] / agg["cache_hit_den"]
                         if agg["cache_hit_den"] else 0.0)
+    all_toks = agg["input"] + agg["output"] + agg["total_cr"] + agg["total_cw"]
+    agg["tokens_per_turn"] = all_toks / agg["turns"] if agg["turns"] else 0
 
     return {
         "time":     datetime.now().strftime("%H:%M:%S"),
@@ -908,6 +918,21 @@ HTML = r"""<!DOCTYPE html>
     min-width: 0;
   }
 
+  /* ── sparkline ── */
+  .sparkline-section { margin-bottom: 14px; }
+  .sparkline-label {
+    font-family: var(--display);
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 5px;
+  }
+  .sparkline-peak { color: var(--cyan); font-family: var(--mono); font-size: 10px; }
+
   /* ── bars ── */
   .bars-section { display: flex; flex-direction: column; gap: 10px; margin-bottom: 18px; }
 
@@ -1033,8 +1058,9 @@ HTML = r"""<!DOCTYPE html>
     align-items: center;
     gap: 8px;
   }
-  .warn-banner.w-warn { background: var(--amber-dim); color: var(--amber); border: 1px solid rgba(245,158,11,0.2); }
-  .warn-banner.w-crit { background: var(--red-dim);   color: var(--red);   border: 1px solid rgba(239,68,68,0.3); animation: crit-pulse 1.5s ease-in-out infinite; }
+  .warn-banner.w-warn    { background: var(--amber-dim); color: var(--amber); border: 1px solid rgba(245,158,11,0.2); }
+  .warn-banner.w-crit    { background: var(--red-dim);   color: var(--red);   border: 1px solid rgba(239,68,68,0.3); animation: crit-pulse 1.5s ease-in-out infinite; }
+  .warn-banner.w-compact { background: rgba(0,212,255,0.07); color: var(--cyan); border: 1px solid rgba(0,212,255,0.18); }
 
   /* cache miss cost banner */
   .cache-miss-banner {
@@ -1191,6 +1217,7 @@ HTML = r"""<!DOCTYPE html>
 const fmt    = n => Number(n).toLocaleString();
 const fmtPct = p => (p * 100).toFixed(1) + '%';
 const fmtCost = c => '$' + Number(c).toFixed(4);
+const fmtTokK = n => n >= 1000 ? (n/1000).toFixed(0)+'K' : Math.round(n).toString();
 
 function barColor(pct, warn=0.80, crit=0.90) {
   return pct >= crit ? 'c-red' : pct >= warn ? 'c-amber' : 'c-green';
@@ -1209,6 +1236,26 @@ function fmtTime(sec) {
   const s = Math.floor(sec % 60);
   if (h > 0) return `${h}h ${m}m ${s}s`;
   return m > 0 ? `${m}m ${s.toString().padStart(2,'0')}s` : `${s}s`;
+}
+
+function renderSparkline(history) {
+  if (!history || !history.length) return '';
+  const W = 3, GAP = 1, H = 28;
+  const peak = Math.max(...history, 1);
+  const totalW = history.length * (W + GAP) - GAP;
+  const fmtTok = n => n >= 1000 ? (n/1000).toFixed(0)+'K' : String(n);
+  const bars = history.map((v, i) => {
+    const h = Math.max(2, Math.round((v / peak) * H));
+    const fill = i === history.length - 1 ? 'var(--cyan)' : 'rgba(0,212,255,0.35)';
+    return `<rect x="${i*(W+GAP)}" y="${H-h}" width="${W}" height="${h}" fill="${fill}"/>`;
+  }).join('');
+  return `<div class="sparkline-section">
+    <div class="sparkline-label">
+      <span>Context growth · per turn</span>
+      <span class="sparkline-peak">peak ${fmtTok(peak)}</span>
+    </div>
+    <svg width="${totalW}" height="${H}" style="display:block">${bars}</svg>
+  </div>`;
 }
 
 function renderBar(label, pct, valueText, subText='', colorOverride=null, rowClass='') {
@@ -1262,7 +1309,10 @@ function renderSession(s) {
   const warn = st.usable_pct >= 0.90
     ? `<div class="warn-banner w-crit">⚠ compaction imminent</div>`
     : st.usable_pct >= 0.80
-    ? `<div class="warn-banner w-warn">⚠ approaching context limit</div>` : '';
+    ? `<div class="warn-banner w-warn">⚠ approaching context limit</div>`
+    : st.context_tokens > 65000
+    ? `<div class="warn-banner w-compact">↓ /compact recommended — context growing</div>`
+    : '';
 
   // cache miss cost estimate
   const ctx = st.context_tokens;
@@ -1305,10 +1355,11 @@ function renderSession(s) {
 
   // per-session footer chips
   const chips = [
-    tile('Turns',   st.turns),
-    tile('Output',  fmt(st.total_output)),
-    tile('Hit',     fmtPct(st.cache_hit), 'cyan'),
-    tile('Cost',    fmtCost(st.cost),     'green'),
+    tile('Turns',    st.turns),
+    tile('Output',   fmt(st.total_output)),
+    tile('Hit',      fmtPct(st.cache_hit),          'cyan'),
+    tile('Tok/turn', fmtTokK(st.tokens_per_turn)),
+    tile('Cost',     fmtCost(st.cost),               'green'),
   ].join('');
 
   return `
@@ -1324,6 +1375,7 @@ function renderSession(s) {
           ${renderBar('Usable',  st.usable_pct, fmtPct(st.usable_pct), fmt(st.usable_left)+' left')}
           ${renderBar('Cache',   cachePct,       cacheVal,              '5 min TTL', cacheColor, 'bar-cache')}
         </div>
+        ${renderSparkline(st.cw_history)}
         <div class="stat-block">
           <div class="stat-block-title">Last Turn</div>
           <div class="stat-row">
@@ -1389,9 +1441,9 @@ function applyData(data) {
   document.getElementById('header-stats').innerHTML = [
     tile('Sessions',   data.sessions.length),
     tile('Turns',      fmt(agg.turns    || 0)),
-    tile('Input tok',  fmt(agg.input    || 0)),
     tile('Output tok', fmt(agg.output   || 0)),
     tile('Cache hit',  fmtPct(agg.cache_hit || 0), 'cyan'),
+    tile('Tok/turn',   fmtTokK(agg.tokens_per_turn || 0)),
     tile('Total cost', fmtCost(agg.cost || 0), costCls),
   ].join('');
 
