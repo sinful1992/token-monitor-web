@@ -38,7 +38,7 @@ CRITICAL_PCT    = 0.90
 CACHE_TTL       = 300
 PLAN_WINDOW     = 5 * 3600
 PLAN_LIMIT      = 280_000  # output-only window limit (observed off-peak ~23:00)
-PLAN_TOTAL_LIMIT = 20_000_000  # total token session limit (to calibrate; ~23M observed 2026-04-13)
+PLAN_TOTAL_LIMIT = 19_000_000  # total token session limit (calibrated 2026-04-13: ~10.3M / 54% ≈ 19M)
 
 PRICES = {
     "input":       3.00,
@@ -48,6 +48,20 @@ PRICES = {
 }
 
 BOOT_TIME = None
+
+# ── peak hours ─────────────────────────────────────────────────────────────
+def is_peak_hours() -> bool:
+    """True during 5am–11am PT weekdays (Anthropic peak: limits drain faster)."""
+    try:
+        from zoneinfo import ZoneInfo
+        pt = ZoneInfo("America/Los_Angeles")
+    except Exception:
+        from datetime import timezone, timedelta as _td
+        pt = timezone(_td(hours=-7))  # PDT fallback
+    now_pt = datetime.now(pt)
+    if now_pt.weekday() >= 5:   # Saturday / Sunday
+        return False
+    return 5 <= now_pt.hour < 11
 
 # ── caches ─────────────────────────────────────────────────────────────────
 # parse_session cache: path -> (mtime, size, result)
@@ -404,7 +418,7 @@ def compute_plan_usage() -> dict:
             all_events.append((ts, turn["output"], total_toks))
 
     if not all_events:
-        return {"used": 0, "used_total": 0, "limit": PLAN_LIMIT, "total_limit": PLAN_TOTAL_LIMIT, "pct": 0.0, "pct_output": 0.0, "reset_at": None}
+        return {"used": 0, "used_total": 0, "limit": PLAN_LIMIT, "total_limit": PLAN_TOTAL_LIMIT, "pct": 0.0, "pct_output": 0.0, "reset_at": None, "is_peak": is_peak_hours()}
 
     all_events.sort(key=lambda x: x[0])
 
@@ -421,13 +435,15 @@ def compute_plan_usage() -> dict:
     reset_in    = window_end - now_ts  # negative = window expired, resets on next message
 
     result = {
-        "used":        total_out,
-        "used_total":  total_all,
-        "limit":       PLAN_LIMIT,
-        "total_limit": PLAN_TOTAL_LIMIT,
-        "pct":         min(1.0, total_all / PLAN_TOTAL_LIMIT),
-        "pct_output":  min(1.0, total_out / PLAN_LIMIT),
-        "reset_at":    window_end if reset_in > 0 else None,
+        "used":          total_out,
+        "used_total":    total_all,
+        "limit":         PLAN_LIMIT,
+        "total_limit":   PLAN_TOTAL_LIMIT,
+        "pct":           min(1.0, total_all / PLAN_TOTAL_LIMIT),
+        "pct_output":    min(1.0, total_out / PLAN_LIMIT),
+        "session_start": session_start,
+        "reset_at":      window_end if reset_in > 0 else None,
+        "is_peak":       is_peak_hours(),
     }
     _plan_cache = (result, time.monotonic() + _PLAN_CACHE_TTL)
     return result
@@ -607,8 +623,8 @@ HTML = r"""<!DOCTYPE html>
   :root {
     --bg:           #080b14;
     --bg-panel:     #0c1022;
-    --card:         rgba(14, 20, 40, 0.85);
-    --card-border:  rgba(255,255,255,0.06);
+    --card:         rgba(18, 26, 52, 0.90);
+    --card-border:  rgba(255,255,255,0.10);
     --cyan:         #00d4ff;
     --cyan-dim:     rgba(0,212,255,0.15);
     --green:        #10b981;
@@ -619,10 +635,10 @@ HTML = r"""<!DOCTYPE html>
     --red-dim:      rgba(239,68,68,0.15);
     --purple:       #7c3aed;
     --purple-dim:   rgba(124,58,237,0.15);
-    --text:         #cbd5e1;
-    --text-bright:  #f1f5f9;
-    --text-muted:   #7ab0cc;
-    --text-dim:     #5080a0;
+    --text:         #e2e8f0;
+    --text-bright:  #ffffff;
+    --text-muted:   #a8cfe0;
+    --text-dim:     #7aabcc;
     --mono:         'JetBrains Mono', monospace;
     --display:      'Rajdhani', sans-serif;
   }
@@ -807,33 +823,42 @@ HTML = r"""<!DOCTYPE html>
   .header-stats {
     max-width: 1400px;
     margin: 0 auto;
-    display: flex;
-    gap: 8px;
-    padding: 0 0 14px;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    padding: 0 0 0;
+    border-top: 1px solid rgba(255,255,255,0.05);
+    margin-top: 4px;
   }
   .stat-tile {
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 7px;
-    padding: 7px 14px;
+    padding: 12px 20px 14px;
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    min-width: 80px;
+    gap: 5px;
+    border-right: 1px solid rgba(255,255,255,0.05);
+    min-width: 0;
+    position: relative;
+  }
+  .stat-tile:last-child { border-right: none; }
+  .stat-tile::after {
+    content: '';
+    position: absolute;
+    bottom: 0; left: 20px; right: 20px;
+    height: 1px;
+    background: transparent;
   }
   .stat-tile-label {
     font-family: var(--display);
     font-size: 10px;
     letter-spacing: 2px;
     text-transform: uppercase;
-    color: #4ec8e0;
+    color: #7ee8f8;
   }
   .stat-tile-val {
-    font-size: 16px;
+    font-size: 20px;
     font-weight: 600;
     color: var(--text-bright);
-    line-height: 1.1;
+    line-height: 1;
+    letter-spacing: -0.5px;
   }
   .stat-tile-val.green  { color: var(--green); }
   .stat-tile-val.cyan   { color: var(--cyan); }
@@ -947,7 +972,7 @@ HTML = r"""<!DOCTYPE html>
     font-size: 11px;
     letter-spacing: 1.5px;
     text-transform: uppercase;
-    color: var(--text);
+    color: var(--text-bright);
     text-align: right;
     white-space: nowrap;
   }
@@ -1024,14 +1049,14 @@ HTML = r"""<!DOCTYPE html>
   .stat-row:last-child { border-bottom: none; }
   .stat-key {
     font-size: 10px;
-    color: var(--text);
+    color: var(--text-muted);
     white-space: nowrap;
     flex-shrink: 0;
   }
   .stat-val {
     font-size: 11px;
-    font-weight: 500;
-    color: var(--text);
+    font-weight: 600;
+    color: var(--text-bright);
     text-align: right;
     white-space: nowrap;
   }
@@ -1144,6 +1169,102 @@ HTML = r"""<!DOCTYPE html>
     100% { background-position: 200% 0; }
   }
 
+  /* ── prediction bar ── */
+  .pred-bar {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 0 28px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    height: 44px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    background: rgba(0,0,0,0.15);
+  }
+  .pred-title {
+    font-family: var(--display);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 2.5px;
+    text-transform: uppercase;
+    color: #f97316;
+    text-shadow: 0 0 16px rgba(249,115,22,0.4);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .pred-label {
+    font-family: var(--display);
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--text);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .pred-burn {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--cyan);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .pred-sep-dot {
+    width: 3px; height: 3px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.15);
+    flex-shrink: 0;
+  }
+  .pred-limit-label {
+    font-family: var(--display);
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--text);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .pred-limit-val {
+    font-size: 15px;
+    font-weight: 700;
+    white-space: nowrap;
+    flex-shrink: 0;
+    font-family: var(--display);
+    letter-spacing: 1px;
+  }
+  .pred-limit-val.green { color: var(--green); }
+  .pred-limit-val.amber { color: var(--amber); }
+  .pred-limit-val.red   { color: var(--red); text-shadow: 0 0 12px rgba(239,68,68,0.5); }
+  .pred-track-wrap {
+    flex: 1;
+    min-width: 60px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .pred-track {
+    flex: 1;
+    height: 3px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .pred-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.8s cubic-bezier(0.4,0,0.2,1);
+  }
+  .pred-fill.green { background: linear-gradient(90deg,#0a8f62,#10b981); box-shadow: 0 0 6px rgba(16,185,129,0.5); }
+  .pred-fill.amber { background: linear-gradient(90deg,#b45309,#f59e0b); box-shadow: 0 0 6px rgba(245,158,11,0.5); }
+  .pred-fill.red   { background: linear-gradient(90deg,#991b1b,#ef4444); box-shadow: 0 0 8px rgba(239,68,68,0.6); }
+  .pred-pct {
+    font-size: 10px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    flex-shrink: 0;
+    min-width: 36px;
+    text-align: right;
+  }
+
   /* ── scrollbar ── */
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -1180,6 +1301,44 @@ HTML = r"""<!DOCTYPE html>
   .agg-chip-val.green { color: var(--green); }
   .agg-chip-val.cyan  { color: var(--cyan); }
   .agg-sep { color: var(--text-dim); font-size: 10px; }
+
+  /* ── peak hours badge ── */
+  .peak-badge {
+    display: none;
+    align-items: center;
+    gap: 7px;
+    margin-left: auto;
+    flex-shrink: 0;
+    padding: 5px 12px;
+    background: rgba(245,158,11,0.10);
+    border: 1px solid rgba(245,158,11,0.40);
+    border-radius: 5px;
+    cursor: default;
+  }
+  .peak-badge.active { display: flex; }
+  .peak-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--amber);
+    box-shadow: 0 0 8px var(--amber), 0 0 16px rgba(245,158,11,0.35);
+    animation: pulse-dot 1.4s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  .peak-label {
+    font-family: var(--display);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 2.5px;
+    text-transform: uppercase;
+    color: var(--amber);
+    white-space: nowrap;
+  }
+  .peak-sub {
+    font-size: 10px;
+    color: rgba(245,158,11,0.55);
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+  }
 </style>
 </head>
 <body>
@@ -1209,6 +1368,25 @@ HTML = r"""<!DOCTYPE html>
   <div class="header-stats" id="header-stats"></div>
 </header>
 
+<div class="pred-bar" id="pred-bar">
+  <span class="pred-title">Prediction</span>
+  <div class="pred-sep-dot"></div>
+  <span class="pred-label">Burn</span>
+  <span class="pred-burn" id="pred-burn">—</span>
+  <div class="pred-sep-dot"></div>
+  <span class="pred-limit-label">Limit in</span>
+  <span class="pred-limit-val green" id="pred-limit-val">—</span>
+  <div class="pred-track-wrap">
+    <div class="pred-track"><div class="pred-fill green" id="pred-fill" style="width:0%"></div></div>
+    <span class="pred-pct" id="pred-pct">0%</span>
+  </div>
+  <div class="peak-badge" id="peak-badge" title="Peak hours: 5am–11am PT weekdays. Anthropic limits drain faster during this window.">
+    <div class="peak-dot"></div>
+    <span class="peak-label">Peak Hours</span>
+    <span class="peak-sub">limits drain faster</span>
+  </div>
+</div>
+
 <main>
   <div class="sessions-grid" id="sessions-grid"></div>
 </main>
@@ -1218,6 +1396,11 @@ const fmt    = n => Number(n).toLocaleString();
 const fmtPct = p => (p * 100).toFixed(1) + '%';
 const fmtCost = c => '$' + Number(c).toFixed(4);
 const fmtTokK = n => n >= 1000 ? (n/1000).toFixed(0)+'K' : Math.round(n).toString();
+function fmtTok(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000)     return (n / 1_000).toFixed(0) + 'K';
+  return String(Math.round(n));
+}
 
 function barColor(pct, warn=0.80, crit=0.90) {
   return pct >= crit ? 'c-red' : pct >= warn ? 'c-amber' : 'c-green';
@@ -1236,6 +1419,40 @@ function fmtTime(sec) {
   const s = Math.floor(sec % 60);
   if (h > 0) return `${h}h ${m}m ${s}s`;
   return m > 0 ? `${m}m ${s.toString().padStart(2,'0')}s` : `${s}s`;
+}
+
+// ── prediction strip ─────────────────────────────────────────────────────
+function updatePredictions(data) {
+  const plan = data.plan || {};
+  const now  = Date.now() / 1000;
+
+  const burnEl  = document.getElementById('pred-burn');
+  const limEl   = document.getElementById('pred-limit-val');
+  const fillEl  = document.getElementById('pred-fill');
+  const pctEl   = document.getElementById('pred-pct');
+  if (!burnEl) return;
+
+  if (!plan.session_start || !plan.used_total) {
+    burnEl.textContent = '—'; limEl.textContent = '—'; return;
+  }
+
+  const elapsed    = Math.max(1, now - plan.session_start);
+  const burnPerSec = plan.used_total / elapsed;
+  const burnPerHr  = burnPerSec * 3600;
+  const tokensLeft = plan.total_limit - plan.used_total;
+  const secsToLim  = burnPerSec > 0 ? tokensLeft / burnPerSec : null;
+  const usedPct    = plan.used_total / plan.total_limit;
+
+  const col = usedPct >= 0.90 ? 'red' : usedPct >= 0.70 ? 'amber' : 'green';
+
+  burnEl.textContent = fmtTok(burnPerHr) + '/hr';
+  limEl.textContent  = secsToLim !== null && secsToLim > 0 ? fmtTime(secsToLim) : 'exceeded';
+  limEl.className    = 'pred-limit-val ' + col;
+
+  const pct = Math.min(100, usedPct * 100).toFixed(1);
+  fillEl.style.width = pct + '%';
+  fillEl.className   = 'pred-fill ' + col;
+  pctEl.textContent  = pct + '%';
 }
 
 function renderSparkline(history) {
@@ -1420,12 +1637,6 @@ function applyData(data) {
   pctBig.textContent = (plan.pct * 100).toFixed(1) + '%';
   pctBig.className = `plan-pct-big ${planCol}`;
 
-  function fmtTok(n) {
-    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-    if (n >= 1_000)     return (n / 1_000).toFixed(0) + 'K';
-    return String(n);
-  }
-
   const valEl = document.getElementById('plan-values');
   const primarySpan   = valEl.querySelector('.plan-bar-primary');
   const secondarySpan = valEl.querySelector('.plan-bar-secondary');
@@ -1434,6 +1645,10 @@ function applyData(data) {
 
   // reset countdown (computed client-side from absolute timestamp)
   updateResetBadge(plan.reset_at);
+
+  // peak hours indicator
+  const peakBadge = document.getElementById('peak-badge');
+  if (peakBadge) peakBadge.classList.toggle('active', !!plan.is_peak);
 
   // aggregate stat tiles
   const agg = data.agg || {};
@@ -1446,6 +1661,9 @@ function applyData(data) {
     tile('Tok/turn',   fmtTokK(agg.tokens_per_turn || 0)),
     tile('Total cost', fmtCost(agg.cost || 0), costCls),
   ].join('');
+
+  // prediction strip
+  updatePredictions(data);
 
   // sessions grid
   const grid = document.getElementById('sessions-grid');
