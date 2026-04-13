@@ -11,11 +11,13 @@ import os
 import re
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
+from watchfiles import awatch
 import uvicorn
 
 # ── constants ──────────────────────────────────────────────────────────────
@@ -42,10 +44,11 @@ BOOT_TIME = None
 _parse_cache: dict = {}
 # plan usage cache: (result, expiry_ts)
 _plan_cache: tuple = (None, 0.0)
-# snapshot cache: (result, expiry_ts)
-_snapshot_cache: tuple = (None, 0.0)
 _PLAN_CACHE_TTL = 10.0      # recompute plan usage at most every 10s
-_SNAPSHOT_CACHE_TTL = 3.0   # recompute full snapshot at most every 3s
+
+# ── live state (updated by background tasks) ───────────────────────────────
+_live_sessions: list = []           # updated every 60s by proc_refresh_loop
+_client_queues: set = set()         # one asyncio.Queue per connected SSE client
 
 
 # ── process helpers ────────────────────────────────────────────────────────
@@ -304,16 +307,11 @@ def compute_plan_usage() -> dict:
 
 # ── snapshot builder ───────────────────────────────────────────────────────
 def build_snapshot() -> dict:
-    global _snapshot_cache
-    now = time.monotonic()
-    if _snapshot_cache[0] is not None and now < _snapshot_cache[1]:
-        return _snapshot_cache[0]
-
-    raw_sessions = find_claude_sessions()
+    """Build snapshot using cached live sessions (no /proc scan here)."""
     sessions_out = []
     agg = {"turns": 0, "cost": 0.0, "output": 0, "cache_hit_num": 0.0, "cache_hit_den": 0}
 
-    for sess in raw_sessions:
+    for sess in _live_sessions:
         turns    = parse_session(sess["jsonl"])
         stats    = compute_stats(turns)
         cwd_name = Path(sess["cwd"]).name or sess["cwd"]
@@ -334,18 +332,64 @@ def build_snapshot() -> dict:
     agg["cache_hit"] = (agg["cache_hit_num"] / agg["cache_hit_den"]
                         if agg["cache_hit_den"] else 0.0)
 
-    result = {
+    return {
         "time":     datetime.now().strftime("%H:%M:%S"),
         "plan":     compute_plan_usage(),
         "agg":      agg,
         "sessions": sessions_out,
     }
-    _snapshot_cache = (result, time.monotonic() + _SNAPSHOT_CACHE_TTL)
-    return result
+
+
+# ── background tasks ────────────────────────────────────────────────────────
+async def proc_refresh_loop():
+    """Refresh live session list (slow /proc scan) every 60s."""
+    global _live_sessions
+    while True:
+        _live_sessions = find_claude_sessions()
+        await asyncio.sleep(60)
+
+
+async def _broadcast(snap: dict) -> None:
+    msg = f"data: {json.dumps(snap)}\n\n"
+    for q in list(_client_queues):
+        try:
+            q.put_nowait(msg)
+        except asyncio.QueueFull:
+            pass
+
+
+async def file_watcher_loop():
+    """Watch ~/.claude/projects/**/*.jsonl; broadcast snapshot on any change."""
+    projects_base = Path.home() / ".claude" / "projects"
+    projects_base.mkdir(parents=True, exist_ok=True)
+    async for changes in awatch(str(projects_base)):
+        if any(p.endswith(".jsonl") for _, p in changes):
+            await _broadcast(build_snapshot())
+
+
+async def heartbeat_loop():
+    """Send a snapshot every 30s so countdown timers stay fresh in the browser."""
+    while True:
+        await asyncio.sleep(30)
+        await _broadcast(build_snapshot())
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _live_sessions
+    _live_sessions = find_claude_sessions()  # initial sync scan
+    tasks = [
+        asyncio.create_task(proc_refresh_loop()),
+        asyncio.create_task(file_watcher_loop()),
+        asyncio.create_task(heartbeat_loop()),
+    ]
+    yield
+    for t in tasks:
+        t.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
 
 HTML = r"""<!DOCTYPE html>
 <!-- v3 -->
@@ -1194,14 +1238,21 @@ async def data():
 
 @app.get("/stream")
 async def stream():
+    queue: asyncio.Queue = asyncio.Queue(maxsize=20)
+    _client_queues.add(queue)
+
     async def generator():
-        while True:
-            try:
-                snap = build_snapshot()
-                yield f"data: {json.dumps(snap)}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            await asyncio.sleep(2)
+        # Send current snapshot immediately on connect
+        try:
+            yield f"data: {json.dumps(build_snapshot())}\n\n"
+        except Exception:
+            pass
+        try:
+            while True:
+                msg = await queue.get()
+                yield msg
+        finally:
+            _client_queues.discard(queue)
 
     return StreamingResponse(
         generator(),

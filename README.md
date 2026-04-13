@@ -2,15 +2,15 @@
 
 A web dashboard for monitoring Claude Code token usage in real time. Reads `~/.claude/projects/` JSONL session files, tracks per-session and aggregate usage, and serves a live dashboard accessible locally or via Tailscale from any device (Windows laptop, phone, etc.).
 
-Built with **FastAPI** + server-sent events (SSE). Single Python file.
+Built with **FastAPI** + server-sent events (SSE). Single Python file. Cross-platform (Linux + Windows).
 
 ## What it does
 
-- **Live session list** — detects running Claude Code processes via `/proc`, shows which session each is using, current context window fill, tokens used/remaining
+- **Live session list** — detects running Claude Code processes via `/proc` (Linux) or process listing (Windows), shows which session each is using, current context window fill, tokens used/remaining
 - **5-hour plan window** — tracks output tokens in a rolling 5h window against the plan's output token limit (calibrated to 237K output tokens per 5h)
 - **Per-session breakdown** — input, cache write, cache read, output tokens per session; cost estimate in USD
 - **Aggregate stats** — total tokens and cost across all active sessions
-- **SSE auto-refresh** — dashboard updates every 3 seconds via server-sent events, no polling needed on the client
+- **SSE push updates** — dashboard updates are pushed instantly when Claude writes new tokens; no polling loop
 - **Tailscale accessible** — binds to `0.0.0.0:8765`, reachable from Windows laptop at `http://home-server.tail7bde5d.ts.net:8765`
 
 ## File locations
@@ -23,7 +23,7 @@ Built with **FastAPI** + server-sent events (SSE). Single Python file.
 ## Install
 
 ```bash
-pip install fastapi uvicorn --break-system-packages
+pip install fastapi uvicorn watchfiles --break-system-packages
 ```
 
 ## Run
@@ -37,9 +37,9 @@ python3 ~/token-monitor-web.py
 ### As a systemd user service (auto-start on login)
 
 ```ini
-# ~/.config/systemd/user/token-monitor-web.service
+# ~/.config/systemd/user/token-monitor.service
 [Unit]
-Description=Claude Token Monitor Web Dashboard
+Description=Claude Code Token Monitor
 
 [Service]
 ExecStart=/usr/bin/python3 /home/giedrius/token-monitor-web.py
@@ -50,17 +50,25 @@ WantedBy=default.target
 ```
 
 ```bash
-systemctl --user enable --now token-monitor-web
+systemctl --user enable --now token-monitor
 ```
 
 ## Architecture
 
 ```
 FastAPI app
-  GET  /           HTML dashboard page (full render)
-  GET  /stream     SSE endpoint — pushes updated snapshot JSON every 3s
-  GET  /api/data   JSON snapshot on demand (used by dashboard JS on load)
+  GET  /        HTML dashboard page (full render)
+  GET  /stream  SSE endpoint — pushes updated snapshot JSON on file change + 30s heartbeat
+  GET  /data    JSON snapshot on demand (used by dashboard JS on initial load)
 ```
+
+### Background tasks (started at app startup)
+
+| Task | Interval | What |
+|------|----------|------|
+| `file_watcher_loop` | event-driven | Watches `~/.claude/projects/` with `watchfiles.awatch`; broadcasts snapshot to all SSE clients when any `.jsonl` changes |
+| `proc_refresh_loop` | every 60s | Refreshes live session list via `/proc` scan |
+| `heartbeat_loop` | every 30s | Sends a snapshot so countdown timers stay fresh even when Claude is idle |
 
 ### Session discovery
 
@@ -69,17 +77,18 @@ FastAPI app
 3. Match the process's working directory (`/proc/{pid}/cwd`) to a `~/.claude/projects/` subdirectory
 4. Read the corresponding JSONL session file, parse token usage from `usage` fields on `assistant` messages
 
-### Caching (important — this is why it doesn't kill CPU)
+This scan runs every 60s in the background — not on every SSE tick.
 
-Three levels:
+### Caching
 
-| Cache | TTL | What |
+Two levels of file-read caching:
+
+| Cache | Key | What |
 |-------|-----|------|
-| `_parse_cache` | mtime+size keyed | Per-file parse result — only re-parsed if file changed |
-| `_snapshot_cache` | 3 seconds | Full dashboard data snapshot |
-| `_plan_cache` | 10 seconds | 5h plan window calculation |
+| `_parse_cache` | file size | Per-file parse result — on growth, seeks to previous size and reads only new bytes |
+| `_plan_cache` | 10s TTL | 5h plan window calculation |
 
-The parse cache is keyed on `(mtime, size)` — same trick as conv-browser. A file that hasn't changed since last read is returned from cache without any I/O. Only the active session file (being appended to) gets re-parsed on each refresh cycle.
+The parse cache is append-aware: when a JSONL file grows, only the newly appended bytes are read and the new turns are merged with the cached result.
 
 ### Key constants
 
@@ -91,7 +100,7 @@ WARN_PCT        = 0.80      # yellow warning threshold
 CRITICAL_PCT    = 0.90      # red critical threshold
 PLAN_WINDOW     = 5 * 3600  # rolling window for plan limit (seconds)
 PLAN_LIMIT      = 237_000   # max output tokens per 5h window (calibrated empirically)
-CACHE_TTL       = 300       # parse cache max age (seconds)
+CACHE_TTL       = 300       # prompt cache TTL (seconds) — used for cache_expires_in display
 ```
 
 ```python
@@ -124,7 +133,7 @@ PRICES = {          # per million tokens, USD
 
 ## Notes
 
-- **Linux only** — uses `/proc` for process discovery. The Windows version (`token-monitor-web-win.py`) uses a different process detection approach.
 - **Read-only** — never writes to `~/.claude/projects/`, only reads JSONL files
+- **Cross-platform** — `watchfiles` uses inotify on Linux and ReadDirectoryChanges on Windows; `/proc` session discovery is Linux-only (sessions show as inactive on Windows but plan usage still works)
 - **Tailscale hostname** — `home-server.tail7bde5d.ts.net` — update if the Tailscale network changes
 - **Plan limit calibration** — `PLAN_LIMIT = 237_000` was measured empirically from actual 5h sessions. Adjust if hitting limits earlier or later than expected.
