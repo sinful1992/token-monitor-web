@@ -246,6 +246,7 @@ def compute_stats(turns: list[dict]) -> dict:
         "usable_pct":       usable_pct,
         "usable_left":      USABLE_LIMIT - context_tokens,
         "cache_hit":        last["cache_read"] / cacheable if cacheable else 0,
+        "total_input":      total_input,
         "total_output":     total_output,
         "cost":             cost,
         "last_input":       last["input"],
@@ -309,7 +310,7 @@ def compute_plan_usage() -> dict:
 def build_snapshot() -> dict:
     """Build snapshot using cached live sessions (no /proc scan here)."""
     sessions_out = []
-    agg = {"turns": 0, "cost": 0.0, "output": 0, "cache_hit_num": 0.0, "cache_hit_den": 0}
+    agg = {"turns": 0, "cost": 0.0, "input": 0, "output": 0, "cache_hit_num": 0.0, "cache_hit_den": 0}
 
     for sess in _live_sessions:
         turns    = parse_session(sess["jsonl"])
@@ -318,6 +319,7 @@ def build_snapshot() -> dict:
         if stats:
             agg["turns"]        += stats["turns"]
             agg["cost"]         += stats["cost"]
+            agg["input"]        += stats["total_input"]
             agg["output"]       += stats["total_output"]
             agg["cache_hit_num"] += stats["cache_hit"] * stats["turns"]
             agg["cache_hit_den"] += stats["turns"]
@@ -1167,6 +1169,7 @@ function applyData(data) {
   document.getElementById('header-stats').innerHTML = [
     tile('Sessions',   data.sessions.length),
     tile('Turns',      fmt(agg.turns    || 0)),
+    tile('Input tok',  fmt(agg.input    || 0)),
     tile('Output tok', fmt(agg.output   || 0)),
     tile('Cache hit',  fmtPct(agg.cache_hit || 0), 'cyan'),
     tile('Total cost', fmtCost(agg.cost || 0), costCls),
