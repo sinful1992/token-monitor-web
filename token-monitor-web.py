@@ -228,13 +228,12 @@ def compute_stats(turns: list[dict]) -> dict:
     usable_pct     = context_tokens / USABLE_LIMIT
     cacheable      = last["cache_read"] + last["input"]
 
-    cache_expires_in = None
+    cache_expires_at = None
     for turn in reversed(turns):
         if turn["cache_write"] > 0 and turn.get("timestamp"):
             try:
-                ts      = datetime.fromisoformat(turn["timestamp"].replace("Z", "+00:00"))
-                elapsed = (datetime.now(timezone.utc) - ts).total_seconds()
-                cache_expires_in = max(0.0, CACHE_TTL - elapsed)
+                ts               = datetime.fromisoformat(turn["timestamp"].replace("Z", "+00:00"))
+                cache_expires_at = ts.timestamp() + CACHE_TTL
             except Exception:
                 pass
             break
@@ -253,7 +252,7 @@ def compute_stats(turns: list[dict]) -> dict:
         "last_cr":          last["cache_read"],
         "last_cw":          last["cache_write"],
         "last_output":      last["output"],
-        "cache_expires_in": cache_expires_in,
+        "cache_expires_at": cache_expires_at,
     }
 
 
@@ -281,7 +280,7 @@ def compute_plan_usage() -> dict:
             events.append((ts, turn["output"]))
 
     if not events:
-        return {"used": 0, "limit": PLAN_LIMIT, "pct": 0.0, "reset_in": None}
+        return {"used": 0, "limit": PLAN_LIMIT, "pct": 0.0, "reset_at": None}
 
     events.sort(key=lambda x: x[0])
 
@@ -300,7 +299,7 @@ def compute_plan_usage() -> dict:
         "used":     total_out,
         "limit":    PLAN_LIMIT,
         "pct":      min(1.0, total_out / PLAN_LIMIT),
-        "reset_in": reset_in if reset_in > 0 else 0,
+        "reset_at": window_end if reset_in > 0 else None,
     }
     _plan_cache = (result, time.monotonic() + _PLAN_CACHE_TTL)
     return result
@@ -988,6 +987,10 @@ function barColor(pct, warn=0.80, crit=0.90) {
 function cardState(pct) {
   return pct >= 0.90 ? 'state-crit' : pct >= 0.80 ? 'state-warn' : 'state-ok';
 }
+function secsUntil(ts) {
+  if (ts == null) return null;
+  return ts - Date.now() / 1000;
+}
 function fmtTime(sec) {
   if (sec == null || sec <= 0) return 'expired';
   const h = Math.floor(sec / 3600);
@@ -997,10 +1000,10 @@ function fmtTime(sec) {
   return m > 0 ? `${m}m ${s.toString().padStart(2,'0')}s` : `${s}s`;
 }
 
-function renderBar(label, pct, valueText, subText='', colorOverride=null) {
+function renderBar(label, pct, valueText, subText='', colorOverride=null, rowClass='') {
   const col = colorOverride || barColor(pct);
   return `
-    <div class="bar-row">
+    <div class="bar-row ${rowClass}">
       <span class="bar-label">${label}</span>
       <div class="bar-track">
         <div class="bar-fill ${col}" style="width:${Math.min(100,pct*100).toFixed(2)}%"></div>
@@ -1035,14 +1038,15 @@ function renderSession(s) {
   const st = s.stats;
   const state = cardState(st.usable_pct);
 
-  const cacheColor = st.cache_expires_in == null ? 'c-cyan'
-    : st.cache_expires_in < 60  ? 'c-red'
-    : st.cache_expires_in < 120 ? 'c-amber' : 'c-cyan';
-  const cacheVal = st.cache_expires_in == null ? 'no write'
-    : st.cache_expires_in <= 0 ? 'EXPIRED'
-    : fmtTime(st.cache_expires_in);
-  const cachePct = st.cache_expires_in == null || st.cache_expires_in <= 0
-    ? 0 : st.cache_expires_in / 300;
+  const cacheSecs = secsUntil(st.cache_expires_at);
+  const cacheColor = st.cache_expires_at == null ? 'c-cyan'
+    : cacheSecs < 60  ? 'c-red'
+    : cacheSecs < 120 ? 'c-amber' : 'c-cyan';
+  const cacheVal = st.cache_expires_at == null ? 'no write'
+    : cacheSecs <= 0 ? 'EXPIRED'
+    : fmtTime(cacheSecs);
+  const cachePct = st.cache_expires_at == null || cacheSecs <= 0
+    ? 0 : cacheSecs / 300;
 
   const warn = st.usable_pct >= 0.90
     ? `<div class="warn-banner w-crit">⚠ compaction imminent</div>`
@@ -1054,7 +1058,7 @@ function renderSession(s) {
   const coldCost = ctx / 1e6 * (3.00 + 3.75); // fresh input + re-write cache
   const warmCost = ctx / 1e6 * 0.30;           // cache read only
   const penalty  = coldCost - warmCost;
-  const cacheMiss = (st.cache_expires_in !== null && st.cache_expires_in <= 0)
+  const cacheMiss = (st.cache_expires_at !== null && cacheSecs <= 0)
     ? `<div class="cache-miss-banner">
         <span class="cache-miss-label">⚡ Next prompt cost · cache expired</span>
         <div class="cache-miss-costs">
@@ -1072,7 +1076,7 @@ function renderSession(s) {
           </div>
         </div>
       </div>`
-    : st.cache_expires_in !== null && st.cache_expires_in < 120
+    : st.cache_expires_at !== null && cacheSecs < 120
     ? `<div class="cache-miss-banner" style="background:rgba(245,158,11,0.06);border-color:rgba(245,158,11,0.2)">
         <span class="cache-miss-label" style="color:var(--amber)">⚡ Cache expiring · next prompt cost</span>
         <div class="cache-miss-costs">
@@ -1107,7 +1111,7 @@ function renderSession(s) {
         <div class="bars-section">
           ${renderBar('Context', st.fill_pct,   fmtPct(st.fill_pct),   fmt(st.context_tokens)+' / 200K')}
           ${renderBar('Usable',  st.usable_pct, fmtPct(st.usable_pct), fmt(st.usable_left)+' left')}
-          ${renderBar('Cache',   cachePct,       cacheVal,              '5 min TTL', cacheColor)}
+          ${renderBar('Cache',   cachePct,       cacheVal,              '5 min TTL', cacheColor, 'bar-cache')}
         </div>
         <div class="stat-block">
           <div class="stat-block-title">Last Turn</div>
@@ -1156,14 +1160,8 @@ function applyData(data) {
   document.getElementById('plan-values').innerHTML =
     `<strong>${fmt(plan.used)}</strong> / ${fmt(plan.limit)} output tokens`;
 
-  // reset countdown
-  if (plan.reset_in != null && plan.reset_in > 0) {
-    document.getElementById('reset-badge').innerHTML =
-      `resets in <strong>${fmtTime(plan.reset_in)}</strong>`;
-  } else {
-    document.getElementById('reset-badge').textContent =
-      plan.reset_in === null ? '' : 'window expired';
-  }
+  // reset countdown (computed client-side from absolute timestamp)
+  updateResetBadge(plan.reset_at);
 
   // aggregate stat tiles
   const agg = data.agg || {};
@@ -1210,10 +1208,52 @@ function applyData(data) {
   }
 }
 
+// ── per-second timer ticker ───────────────────────────────────────────────
+let _lastData = null;
+
+function updateResetBadge(reset_at) {
+  const secs = secsUntil(reset_at);
+  const el = document.getElementById('reset-badge');
+  if (!el) return;
+  if (reset_at == null)       el.textContent = '';
+  else if (secs <= 0)         el.textContent = 'window expired';
+  else el.innerHTML = `resets in <strong>${fmtTime(secs)}</strong>`;
+}
+
+function tickTimers() {
+  if (!_lastData) return;
+  const plan = _lastData.plan || {};
+  updateResetBadge(plan.reset_at);
+  for (const s of (_lastData.sessions || [])) {
+    if (!s.has_data) continue;
+    const st = s.stats;
+    const cacheSecs = secsUntil(st.cache_expires_at);
+    const card = document.getElementById(`card-${s.pid}`);
+    if (!card) continue;
+    // update cache bar value text and progress
+    const cacheRow = card.querySelector('.bar-cache');
+    if (!cacheRow) continue;
+    const barVal  = cacheRow.querySelector('.bar-value');
+    const barFill = cacheRow.querySelector('.bar-fill');
+    const newColor = st.cache_expires_at == null ? 'c-cyan' : cacheSecs < 60 ? 'c-red' : cacheSecs < 120 ? 'c-amber' : 'c-cyan';
+    if (barVal) {
+      barVal.textContent = st.cache_expires_at == null ? 'no write' : cacheSecs <= 0 ? 'EXPIRED' : fmtTime(cacheSecs);
+      barVal.className = `bar-value ${newColor}`;
+    }
+    if (barFill) {
+      const pct = st.cache_expires_at == null || cacheSecs <= 0 ? 0 : cacheSecs / 300;
+      barFill.style.width = (Math.max(0, Math.min(1, pct)) * 100) + '%';
+      barFill.className = `bar-fill ${newColor}`;
+    }
+  }
+}
+
+setInterval(tickTimers, 1000);
+
 function connect() {
   const src = new EventSource('/stream');
   const dot = document.querySelector('.live-dot');
-  src.onmessage = e => { try { applyData(JSON.parse(e.data)); } catch {} };
+  src.onmessage = e => { try { _lastData = JSON.parse(e.data); applyData(_lastData); } catch {} };
   src.onerror   = () => {
     src.close(); setTimeout(connect, 3000);
     dot.style.cssText = 'background:var(--red);box-shadow:0 0 8px var(--red)';
@@ -1223,7 +1263,7 @@ function connect() {
   };
 }
 
-fetch('/data').then(r => r.json()).then(applyData).finally(connect);
+fetch('/data').then(r => r.json()).then(d => { _lastData = d; applyData(d); }).finally(connect);
 </script>
 </body>
 </html>"""
