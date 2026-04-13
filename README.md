@@ -82,6 +82,7 @@ FastAPI app
 |------|----------|------|
 | `file_watcher_loop` | event-driven | Watches `~/.claude/projects/` with `watchfiles.awatch`; broadcasts snapshot to all SSE clients when any `.jsonl` changes |
 | `proc_refresh_loop` | every 60s | Refreshes live session list via `psutil` (falls back to `/proc` on Linux if psutil unavailable) |
+| `watch_pid_death` | event-driven | One task per active Claude PID; detects process exit instantly and broadcasts — zero CPU polling (see below) |
 | `heartbeat_loop` | every 30s | Sends a snapshot so countdown timers stay fresh even when Claude is idle |
 
 ### Session discovery
@@ -92,7 +93,17 @@ FastAPI app
 4. Prefer the most recently modified `.jsonl` over the session meta file pointer — this ensures the correct session is shown after `/clear`, which creates a new session file without updating the meta pointer
 5. Parse token usage from `usage` fields on `assistant` messages
 
-This scan runs every 60s in the background and also on every `.jsonl` file change event.
+This scan runs every 60s in the background and also on every `.jsonl` file change event. When a new PID is discovered, `_start_pid_watchers()` spawns a `watch_pid_death` task for it.
+
+### Process death detection
+
+When a Claude terminal is closed, the dashboard removes it immediately rather than waiting for the next 60s scan:
+
+- **Linux 5.3+** — `os.pidfd_open()` opens a kernel file descriptor for the PID; asyncio watches it as a reader. The kernel signals it the instant the process exits. Measured latency: ~1ms. Zero CPU.
+- **Windows** — `psutil.Process.wait()` runs in a thread executor, which internally calls `WaitForSingleObject`. Truly blocking OS call, zero CPU.
+- **Linux fallback** (no pidfd) — same psutil executor path; psutil uses exponential-backoff polling for non-child processes.
+
+On death: the PID is evicted from `_live_sessions` and a snapshot is broadcast immediately.
 
 **Terminal label** — on Linux shows the pts number (e.g. `pts/2`); on Windows shows the parent process name (e.g. `windowsterminal`, `powershell`).
 

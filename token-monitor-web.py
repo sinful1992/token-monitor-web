@@ -58,6 +58,7 @@ _PLAN_CACHE_TTL = 10.0      # recompute plan usage at most every 10s
 # ── live state (updated by background tasks) ───────────────────────────────
 _live_sessions: list = []           # updated every 60s by proc_refresh_loop
 _client_queues: set = set()         # one asyncio.Queue per connected SSE client
+_watched_pids:  set = set()         # PIDs that already have a death-watcher task
 
 
 # ── process helpers ────────────────────────────────────────────────────────
@@ -427,6 +428,9 @@ def build_snapshot() -> dict:
     agg = {"turns": 0, "cost": 0.0, "input": 0, "output": 0, "cache_hit_num": 0.0, "cache_hit_den": 0}
 
     for sess in _live_sessions:
+        # Skip stale entries — process died since last 60s refresh
+        if not os.path.exists(f"/proc/{sess['pid']}"):
+            continue
         turns    = parse_session(sess["jsonl"])
         stats    = compute_stats(turns)
         cwd_name = Path(sess["cwd"]).name or sess["cwd"]
@@ -456,12 +460,73 @@ def build_snapshot() -> dict:
     }
 
 
+# ── pid death watching ─────────────────────────────────────────────────────
+async def watch_pid_death(pid: int) -> None:
+    """
+    Wait for the Claude process to exit, then remove it from _live_sessions
+    and broadcast immediately.  Zero CPU:
+      - Linux 5.3+  : pidfd_open → asyncio reader (kernel event, no polling)
+      - Windows/else: psutil.Process.wait() in a thread executor
+                      (WaitForSingleObject on Windows, psutil backoff elsewhere)
+    """
+    global _live_sessions, _watched_pids
+    loop = asyncio.get_running_loop()
+
+    try:
+        if hasattr(os, "pidfd_open"):
+            # Linux 5.3+ — true event-driven, zero CPU
+            try:
+                fd = os.pidfd_open(pid)
+            except OSError:
+                return  # process already gone
+            fut: asyncio.Future = loop.create_future()
+
+            def _readable():
+                loop.remove_reader(fd)
+                os.close(fd)
+                if not fut.done():
+                    fut.set_result(None)
+
+            loop.add_reader(fd, _readable)
+            try:
+                await fut
+            except asyncio.CancelledError:
+                loop.remove_reader(fd)
+                os.close(fd)
+                raise
+        elif _PSUTIL:
+            # Windows (WaitForSingleObject) or Linux fallback (psutil backoff)
+            try:
+                proc = psutil.Process(pid)
+                await loop.run_in_executor(None, proc.wait)
+            except psutil.NoSuchProcess:
+                pass  # already gone — still do the cleanup below
+        else:
+            return  # no mechanism available
+    finally:
+        _watched_pids.discard(pid)
+
+    # Process is gone — evict from live sessions and push update
+    _live_sessions = [s for s in _live_sessions if s["pid"] != pid]
+    await _broadcast(build_snapshot())
+
+
+def _start_pid_watchers() -> None:
+    """Spawn a watch_pid_death task for any PID not already being watched."""
+    for sess in _live_sessions:
+        pid = sess["pid"]
+        if pid not in _watched_pids:
+            _watched_pids.add(pid)
+            asyncio.create_task(watch_pid_death(pid))
+
+
 # ── background tasks ────────────────────────────────────────────────────────
 async def proc_refresh_loop():
     """Refresh live session list (slow /proc scan) every 60s."""
     global _live_sessions
     while True:
         _live_sessions = find_claude_sessions()
+        _start_pid_watchers()
         await asyncio.sleep(60)
 
 
@@ -482,6 +547,7 @@ async def file_watcher_loop():
     async for changes in awatch(str(projects_base)):
         if any(p.endswith(".jsonl") for _, p in changes):
             _live_sessions = find_claude_sessions()  # always fresh on activity
+            _start_pid_watchers()
             await _broadcast(build_snapshot())
 
 
@@ -497,6 +563,7 @@ async def heartbeat_loop():
 async def lifespan(app: FastAPI):
     global _live_sessions
     _live_sessions = find_claude_sessions()  # initial sync scan
+    _start_pid_watchers()
     tasks = [
         asyncio.create_task(proc_refresh_loop()),
         asyncio.create_task(file_watcher_loop()),
