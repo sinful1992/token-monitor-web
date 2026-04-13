@@ -8,6 +8,7 @@ Open: http://localhost:8765   (or via Tailscale from Windows)
 
 import json
 import os
+import platform
 import re
 import asyncio
 import time
@@ -19,6 +20,14 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
 from watchfiles import awatch
 import uvicorn
+
+try:
+    import psutil
+    _PSUTIL = True
+except ImportError:
+    _PSUTIL = False
+
+IS_WINDOWS = platform.system() == "Windows"
 
 # ── constants ──────────────────────────────────────────────────────────────
 CONTEXT_LIMIT   = 200_000
@@ -52,6 +61,8 @@ _client_queues: set = set()         # one asyncio.Queue per connected SSE client
 
 
 # ── process helpers ────────────────────────────────────────────────────────
+BOOT_TIME = None
+
 def get_boot_time() -> float:
     global BOOT_TIME
     if BOOT_TIME is None:
@@ -74,8 +85,148 @@ def proc_start_time(pid: int) -> float:
         return 0.0
 
 
+def cwd_to_project_key(cwd: str) -> str:
+    """Convert a working directory path to the ~/.claude/projects subdirectory name.
+    Mirrors how Claude Code maps cwd to project dir on each platform."""
+    if IS_WINDOWS:
+        # C:\Users\foo -> C--Users-foo
+        return cwd.replace("\\", "-").replace(":", "-").replace("/", "-")
+    return cwd.replace("/", "-")
+
+
+def _pts_for_pid_linux(pid: int) -> str:
+    """Return the pts number for a Linux process, or '?' if not found."""
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                t = os.readlink(f"/proc/{pid}/fd/{fd}")
+                if "/dev/pts/" in t:
+                    return t.split("/dev/pts/")[-1]
+            except OSError:
+                pass
+    except (OSError, PermissionError):
+        pass
+    return "?"
+
+
+def _pts_for_proc_psutil(proc) -> str:
+    """Return a terminal label for a process using psutil (cross-platform)."""
+    if not IS_WINDOWS:
+        # On Linux prefer /proc fd scan (more reliable than psutil terminal())
+        try:
+            t = proc.terminal()
+            if t and "/dev/pts/" in t:
+                return t.split("/dev/pts/")[-1]
+        except Exception:
+            pass
+        return _pts_for_pid_linux(proc.pid)
+    # Windows: show parent process name as a proxy for terminal type
+    try:
+        parent = proc.parent()
+        if parent:
+            name = parent.name().lower().replace(".exe", "")
+            return name  # e.g. "windowsterminal", "powershell", "cmd"
+    except Exception:
+        pass
+    return "?"
+
+
+def _resolve_jsonl(projects_base: Path, cwd: str, pid: int) -> "Path | None":
+    """Find the current session jsonl for a given cwd + pid."""
+    proj_dir = projects_base / cwd_to_project_key(cwd)
+    if not proj_dir.exists():
+        return None
+
+    candidates = []
+    for jf in proj_dir.glob("*.jsonl"):
+        try:
+            candidates.append((jf.stat().st_mtime, jf))
+        except OSError:
+            pass
+    if not candidates:
+        return None
+    newest_mtime, newest_path = max(candidates)
+
+    # Try meta file for exact session ID, but only use it if it's the newest file.
+    # After /clear, Claude doesn't update the meta file, so the meta pointer can
+    # be stale while the real current session is a newer file.
+    jsonl_path = newest_path
+    meta_file  = Path.home() / ".claude" / "sessions" / f"{pid}.json"
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text())
+            sid  = meta.get("sessionId")
+            if sid:
+                candidate = proj_dir / f"{sid}.jsonl"
+                if candidate.exists():
+                    try:
+                        meta_mtime = candidate.stat().st_mtime
+                    except OSError:
+                        meta_mtime = 0.0
+                    if meta_mtime >= newest_mtime:
+                        jsonl_path = candidate
+        except Exception:
+            pass
+
+    return jsonl_path
+
+
 # ── session discovery ──────────────────────────────────────────────────────
 def find_claude_sessions() -> list[dict]:
+    if _PSUTIL:
+        return _find_sessions_psutil()
+    if not IS_WINDOWS:
+        return _find_sessions_proc()
+    return []
+
+
+def _find_sessions_psutil() -> list[dict]:
+    sessions      = []
+    projects_base = Path.home() / ".claude" / "projects"
+
+    for proc in psutil.process_iter(["pid", "name", "cmdline", "cwd", "create_time"]):
+        try:
+            name    = (proc.info["name"] or "").lower()
+            cmdline = proc.info["cmdline"] or []
+            # Match "claude" or "claude.exe" either as name or first cmdline token
+            exe_name = Path(cmdline[0]).name.lower() if cmdline else ""
+            if not (name in ("claude", "claude.exe") or
+                    exe_name in ("claude", "claude.exe")):
+                continue
+
+            cwd = proc.info["cwd"] or ""
+            if not cwd:
+                continue
+
+            pid        = proc.info["pid"]
+            start_time = proc.info["create_time"] or 0.0
+            pts        = _pts_for_proc_psutil(proc)
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+        jsonl_path = _resolve_jsonl(projects_base, cwd, pid)
+        if jsonl_path is None:
+            continue
+
+        sessions.append({
+            "pid":        pid,
+            "pts":        pts,
+            "cwd":        cwd,
+            "jsonl":      jsonl_path,
+            "start_time": start_time,
+        })
+
+    seen = {}
+    for s in sessions:
+        key = str(s["jsonl"])
+        if key not in seen:
+            seen[key] = s
+    return list(seen.values())
+
+
+def _find_sessions_proc() -> list[dict]:
+    """Linux-only fallback when psutil is not installed."""
     sessions      = []
     projects_base = Path.home() / ".claude" / "projects"
 
@@ -99,48 +250,12 @@ def find_claude_sessions() -> list[dict]:
         except (OSError, PermissionError):
             continue
 
-        pts = "?"
-        try:
-            for fd in os.listdir(f"/proc/{pid}/fd"):
-                try:
-                    t = os.readlink(f"/proc/{pid}/fd/{fd}")
-                    if "/dev/pts/" in t:
-                        pts = t.split("/dev/pts/")[-1]
-                        break
-                except OSError:
-                    pass
-        except (OSError, PermissionError):
-            pass
-
+        pts        = _pts_for_pid_linux(pid)
         start_time = proc_start_time(pid)
 
-        # Try exact session file first
-        jsonl_path = None
-        meta_file  = Path.home() / ".claude" / "sessions" / f"{pid}.json"
-        if meta_file.exists():
-            try:
-                meta = json.loads(meta_file.read_text())
-                sid  = meta.get("sessionId")
-                if sid:
-                    candidate = projects_base / cwd.replace("/", "-") / f"{sid}.jsonl"
-                    if candidate.exists():
-                        jsonl_path = candidate
-            except Exception:
-                pass
-
+        jsonl_path = _resolve_jsonl(projects_base, cwd, pid)
         if jsonl_path is None:
-            proj_dir = projects_base / cwd.replace("/", "-")
-            if not proj_dir.exists():
-                continue
-            candidates = []
-            for jf in proj_dir.glob("*.jsonl"):
-                try:
-                    candidates.append((jf.stat().st_mtime, jf))
-                except OSError:
-                    pass
-            if not candidates:
-                continue
-            jsonl_path = max(candidates)[1]
+            continue
 
         sessions.append({
             "pid":        pid,

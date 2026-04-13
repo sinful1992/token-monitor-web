@@ -6,7 +6,7 @@ Built with **FastAPI** + server-sent events (SSE). Single Python file. Cross-pla
 
 ## What it does
 
-- **Live session list** — detects running Claude Code processes via `/proc` (Linux) or process listing (Windows), shows which session each is using, current context window fill, tokens used/remaining
+- **Live session list** — detects running Claude Code processes via `psutil` (cross-platform), shows which session each is using, current context window fill, tokens used/remaining
 - **5-hour plan window** — tracks output tokens in a rolling 5h window against the plan's output token limit (calibrated to 237K output tokens per 5h)
 - **Per-session breakdown** — input, cache write, cache read, output tokens per session; cost estimate in USD
 - **Aggregate stats** — total tokens and cost across all active sessions
@@ -23,7 +23,13 @@ Built with **FastAPI** + server-sent events (SSE). Single Python file. Cross-pla
 ## Install
 
 ```bash
-pip install fastapi uvicorn watchfiles --break-system-packages
+pip install fastapi uvicorn watchfiles psutil --break-system-packages
+```
+
+On Windows (no `--break-system-packages` needed):
+
+```powershell
+pip install fastapi uvicorn watchfiles psutil
 ```
 
 ## Run
@@ -34,7 +40,7 @@ python3 ~/token-monitor-web.py
 # Tailscale: http://home-server.tail7bde5d.ts.net:8765
 ```
 
-### As a systemd user service (auto-start on login)
+### As a systemd user service (Linux, auto-start on login)
 
 ```ini
 # ~/.config/systemd/user/token-monitor.service
@@ -42,7 +48,7 @@ python3 ~/token-monitor-web.py
 Description=Claude Code Token Monitor
 
 [Service]
-ExecStart=/usr/bin/python3 /home/giedrius/token-monitor-web.py
+ExecStart=/usr/bin/python3 /home/YOUR_USER/token-monitor-web.py
 Restart=on-failure
 
 [Install]
@@ -51,6 +57,14 @@ WantedBy=default.target
 
 ```bash
 systemctl --user enable --now token-monitor
+```
+
+### As a Windows startup task
+
+Run at login via Task Scheduler, or add to your shell profile:
+
+```powershell
+Start-Process pythonw -ArgumentList "$HOME\token-monitor-web.py" -WindowStyle Hidden
 ```
 
 ## Architecture
@@ -67,17 +81,20 @@ FastAPI app
 | Task | Interval | What |
 |------|----------|------|
 | `file_watcher_loop` | event-driven | Watches `~/.claude/projects/` with `watchfiles.awatch`; broadcasts snapshot to all SSE clients when any `.jsonl` changes |
-| `proc_refresh_loop` | every 60s | Refreshes live session list via `/proc` scan |
+| `proc_refresh_loop` | every 60s | Refreshes live session list via `psutil` (falls back to `/proc` on Linux if psutil unavailable) |
 | `heartbeat_loop` | every 30s | Sends a snapshot so countdown timers stay fresh even when Claude is idle |
 
 ### Session discovery
 
-1. Walk `/proc` for all running PIDs
-2. For each PID, read `/proc/{pid}/cmdline` — look for `claude` processes
-3. Match the process's working directory (`/proc/{pid}/cwd`) to a `~/.claude/projects/` subdirectory
-4. Read the corresponding JSONL session file, parse token usage from `usage` fields on `assistant` messages
+1. Iterate running processes via `psutil.process_iter()` (cross-platform; falls back to `/proc` on Linux if psutil is absent)
+2. Match processes named `claude` / `claude.exe`
+3. Map the process's cwd to a `~/.claude/projects/` subdirectory (handles both Linux `/` and Windows `\` paths)
+4. Prefer the most recently modified `.jsonl` over the session meta file pointer — this ensures the correct session is shown after `/clear`, which creates a new session file without updating the meta pointer
+5. Parse token usage from `usage` fields on `assistant` messages
 
-This scan runs every 60s in the background — not on every SSE tick.
+This scan runs every 60s in the background and also on every `.jsonl` file change event.
+
+**Terminal label** — on Linux shows the pts number (e.g. `pts/2`); on Windows shows the parent process name (e.g. `windowsterminal`, `powershell`).
 
 ### Caching
 
@@ -134,6 +151,7 @@ PRICES = {          # per million tokens, USD
 ## Notes
 
 - **Read-only** — never writes to `~/.claude/projects/`, only reads JSONL files
-- **Cross-platform** — `watchfiles` uses inotify on Linux and ReadDirectoryChanges on Windows; `/proc` session discovery is Linux-only (sessions show as inactive on Windows but plan usage still works)
-- **Tailscale hostname** — `home-server.tail7bde5d.ts.net` — update if the Tailscale network changes
-- **Plan limit calibration** — `PLAN_LIMIT = 237_000` was measured empirically from actual 5h sessions. Adjust if hitting limits earlier or later than expected.
+- **Cross-platform** — `psutil` handles process discovery on both Linux and Windows; `watchfiles` uses inotify on Linux and ReadDirectoryChanges on Windows
+- **`/clear` handling** — after `/clear`, Claude creates a new session file without updating the meta pointer; the monitor detects this by preferring the newest `.jsonl` over the meta-pinned one
+- **Tailscale hostname** — update `home-server.tail7bde5d.ts.net` in the code if your Tailscale network name differs
+- **Plan limit calibration** — `PLAN_LIMIT = 280_000` was measured empirically. Adjust if hitting limits earlier or later than expected.
