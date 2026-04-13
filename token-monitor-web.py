@@ -362,10 +362,12 @@ async def _broadcast(snap: dict) -> None:
 
 async def file_watcher_loop():
     """Watch ~/.claude/projects/**/*.jsonl; broadcast snapshot on any change."""
+    global _live_sessions
     projects_base = Path.home() / ".claude" / "projects"
     projects_base.mkdir(parents=True, exist_ok=True)
     async for changes in awatch(str(projects_base)):
         if any(p.endswith(".jsonl") for _, p in changes):
+            _live_sessions = find_claude_sessions()  # always fresh on activity
             await _broadcast(build_snapshot())
 
 
