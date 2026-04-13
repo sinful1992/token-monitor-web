@@ -37,7 +37,8 @@ WARN_PCT        = 0.80
 CRITICAL_PCT    = 0.90
 CACHE_TTL       = 300
 PLAN_WINDOW     = 5 * 3600
-PLAN_LIMIT      = 280_000  # observed off-peak (~23:00); actual peak limit unknown
+PLAN_LIMIT      = 280_000  # output-only window limit (observed off-peak ~23:00)
+PLAN_TOTAL_LIMIT = 20_000_000  # total token session limit (to calibrate; ~23M observed 2026-04-13)
 
 PRICES = {
     "input":       3.00,
@@ -383,7 +384,8 @@ def compute_plan_usage() -> dict:
     now_ts = datetime.now(timezone.utc).timestamp()
 
     # Re-use parse_session() cache — avoids re-reading files that haven't changed
-    events = []
+    # Collect (timestamp, output_tokens, total_tokens) per turn in one pass
+    all_events = []
     for jsonl in projects_base.glob("**/*.jsonl"):
         for turn in parse_session(jsonl):
             ts_str = turn.get("timestamp")
@@ -393,29 +395,34 @@ def compute_plan_usage() -> dict:
                 ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
             except Exception:
                 continue
-            events.append((ts, turn["output"]))
+            total_toks = turn["input"] + turn["cache_read"] + turn["cache_write"] + turn["output"]
+            all_events.append((ts, turn["output"], total_toks))
 
-    if not events:
-        return {"used": 0, "limit": PLAN_LIMIT, "pct": 0.0, "reset_at": None}
+    if not all_events:
+        return {"used": 0, "used_total": 0, "limit": PLAN_LIMIT, "total_limit": PLAN_TOTAL_LIMIT, "pct": 0.0, "pct_output": 0.0, "reset_at": None}
 
-    events.sort(key=lambda x: x[0])
+    all_events.sort(key=lambda x: x[0])
 
     # Walk forward: a new session begins whenever a message arrives after
     # the current session's 5h window has expired.
-    session_start = events[0][0]
-    for i in range(1, len(events)):
-        if events[i][0] >= session_start + PLAN_WINDOW:
-            session_start = events[i][0]
+    session_start = all_events[0][0]
+    for i in range(1, len(all_events)):
+        if all_events[i][0] >= session_start + PLAN_WINDOW:
+            session_start = all_events[i][0]
 
-    total_out = sum(out for ts, out in events if ts >= session_start)
-    window_end = session_start + PLAN_WINDOW
-    reset_in = window_end - now_ts  # negative = window expired, resets on next message
+    total_out   = sum(out for ts, out, tot in all_events if ts >= session_start)
+    total_all   = sum(tot for ts, out, tot in all_events if ts >= session_start)
+    window_end  = session_start + PLAN_WINDOW
+    reset_in    = window_end - now_ts  # negative = window expired, resets on next message
 
     result = {
-        "used":     total_out,
-        "limit":    PLAN_LIMIT,
-        "pct":      min(1.0, total_out / PLAN_LIMIT),
-        "reset_at": window_end if reset_in > 0 else None,
+        "used":        total_out,
+        "used_total":  total_all,
+        "limit":       PLAN_LIMIT,
+        "total_limit": PLAN_TOTAL_LIMIT,
+        "pct":         min(1.0, total_all / PLAN_TOTAL_LIMIT),
+        "pct_output":  min(1.0, total_out / PLAN_LIMIT),
+        "reset_at":    window_end if reset_in > 0 else None,
     }
     _plan_cache = (result, time.monotonic() + _PLAN_CACHE_TTL)
     return result
@@ -690,34 +697,62 @@ HTML = r"""<!DOCTYPE html>
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    margin-bottom: 6px;
+    margin-bottom: 7px;
   }
   .plan-bar-label-left {
     font-family: var(--display);
-    font-size: 10px;
-    letter-spacing: 2px;
+    font-size: 11px;
+    letter-spacing: 2.5px;
     text-transform: uppercase;
     color: #4ec8e0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .plan-bar-badge {
+    font-size: 9px;
+    letter-spacing: 1.5px;
+    background: rgba(0,212,255,0.12);
+    border: 1px solid rgba(0,212,255,0.25);
+    border-radius: 3px;
+    padding: 1px 6px;
+    color: var(--cyan);
+    vertical-align: middle;
   }
   .plan-bar-label-right {
-    font-size: 11px;
-    color: var(--text-muted);
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
   }
-  .plan-bar-label-right strong { color: var(--text-bright); font-weight: 500; }
+  .plan-bar-primary {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-bright);
+  }
+  .plan-bar-primary strong { font-weight: 700; }
+  .plan-bar-secondary {
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.5px;
+  }
+  .plan-bar-secondary strong { color: var(--text-muted); font-weight: 500; }
   .plan-track {
-    height: 8px;
-    background: rgba(255,255,255,0.06);
-    border-radius: 4px;
+    height: 11px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 6px;
     overflow: hidden;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.4);
+    position: relative;
   }
   .plan-fill {
     height: 100%;
-    border-radius: 4px;
-    transition: width 0.8s cubic-bezier(0.4,0,0.2,1), background 0.5s ease;
+    border-radius: 6px;
+    transition: width 0.8s cubic-bezier(0.4,0,0.2,1), background 0.5s ease, box-shadow 0.5s ease;
   }
-  .plan-fill.c-green { background: linear-gradient(90deg,#0d9e6e,#10b981); box-shadow: 0 0 10px rgba(16,185,129,0.4); }
-  .plan-fill.c-amber { background: linear-gradient(90deg,#d97706,#f59e0b); box-shadow: 0 0 10px rgba(245,158,11,0.4); }
-  .plan-fill.c-red   { background: linear-gradient(90deg,#dc2626,#ef4444); box-shadow: 0 0 12px rgba(239,68,68,0.5); }
+  .plan-fill.c-green { background: linear-gradient(90deg,#0a8f62,#10b981,#34d399); box-shadow: 0 0 16px rgba(16,185,129,0.55), 0 0 32px rgba(16,185,129,0.2); }
+  .plan-fill.c-amber { background: linear-gradient(90deg,#b45309,#f59e0b,#fcd34d); box-shadow: 0 0 16px rgba(245,158,11,0.55), 0 0 32px rgba(245,158,11,0.2); }
+  .plan-fill.c-red   { background: linear-gradient(90deg,#991b1b,#ef4444,#f87171); box-shadow: 0 0 18px rgba(239,68,68,0.6),  0 0 36px rgba(239,68,68,0.25); }
 
   /* reset + clock */
   .header-clock-block {
@@ -923,16 +958,7 @@ HTML = r"""<!DOCTYPE html>
   .bar-value.c-red    { color: var(--red); }
   .bar-value.c-cyan   { color: var(--cyan); }
 
-  /* bigger plan bar in header */
-  .plan-track { height: 5px; background: rgba(255,255,255,0.06); border-radius: 3px; overflow: hidden; }
-  .plan-fill  {
-    height: 100%;
-    border-radius: 3px;
-    transition: width 0.8s cubic-bezier(0.4,0,0.2,1), background 0.5s ease;
-  }
-  .plan-fill.c-green  { background: linear-gradient(90deg,#0d9e6e,#10b981); box-shadow: 0 0 8px rgba(16,185,129,0.4); }
-  .plan-fill.c-amber  { background: linear-gradient(90deg,#d97706,#f59e0b); box-shadow: 0 0 8px rgba(245,158,11,0.4); }
-  .plan-fill.c-red    { background: linear-gradient(90deg,#dc2626,#ef4444); box-shadow: 0 0 8px rgba(239,68,68,0.5); }
+  /* plan bar sub-text */
 
   .bar-sub {
     font-size: 10px;
@@ -1139,8 +1165,11 @@ HTML = r"""<!DOCTYPE html>
     <div class="plan-pct-big c-green" id="plan-pct-big">—%</div>
     <div class="plan-block">
       <div class="plan-bar-label">
-        <span class="plan-bar-label-left">5h Window</span>
-        <span class="plan-bar-label-right" id="plan-values">—</span>
+        <span class="plan-bar-label-left">5h Window <span class="plan-bar-badge">TOTAL TOKENS</span></span>
+        <div class="plan-bar-label-right" id="plan-values">
+          <span class="plan-bar-primary">—</span>
+          <span class="plan-bar-secondary">— output</span>
+        </div>
       </div>
       <div class="plan-track"><div class="plan-fill c-green" id="plan-fill" style="width:0%"></div></div>
     </div>
@@ -1328,7 +1357,7 @@ function tile(label, val, cls='') {
 function applyData(data) {
   document.getElementById('clock').textContent = data.time;
 
-  // plan bar
+  // plan bar — primary metric is total tokens
   const plan = data.plan;
   const planCol = barColor(plan.pct, 0.70, 0.90);
   const fill = document.getElementById('plan-fill');
@@ -1339,8 +1368,17 @@ function applyData(data) {
   pctBig.textContent = (plan.pct * 100).toFixed(1) + '%';
   pctBig.className = `plan-pct-big ${planCol}`;
 
-  document.getElementById('plan-values').innerHTML =
-    `<strong>${fmt(plan.used)}</strong> / ${fmt(plan.limit)} output tokens`;
+  function fmtTok(n) {
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000)     return (n / 1_000).toFixed(0) + 'K';
+    return String(n);
+  }
+
+  const valEl = document.getElementById('plan-values');
+  const primarySpan   = valEl.querySelector('.plan-bar-primary');
+  const secondarySpan = valEl.querySelector('.plan-bar-secondary');
+  if (primarySpan)   primarySpan.innerHTML   = `<strong>${fmtTok(plan.used_total)}</strong> / ${fmtTok(plan.total_limit)} total`;
+  if (secondarySpan) secondarySpan.innerHTML = `<strong>${fmtTok(plan.used)}</strong> output`;
 
   // reset countdown (computed client-side from absolute timestamp)
   updateResetBadge(plan.reset_at);
